@@ -1,0 +1,19 @@
+# ---- 个人数据，绝不进仓库 ----
+flashpadx.dat
+flashpadx.ini
+flashpadx-error.log
+*.dat
+*.tmp
+backup/
+
+# 本地使用说明（含本机路径和个人环境配置），仓库里用 README.md
+README.txt
+
+# ---- 编译产物 / 日志 ----
+build.log
+*.exe
+*.pdb
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
