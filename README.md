@@ -58,5 +58,6 @@ build.bat
 ## 说明
 
 - 仅支持 Windows（WinForms + P/Invoke 的 `RegisterHotKey`）
+- **窗口位置自动回正**：窗口位置和大小记在 `flashpadx.ini` 里，保存时用的是 `RestoreBounds`，不会把最小化时的 `-32000` 占位坐标存进去；万一窗口落在所有屏幕之外（换过显示器、异常退出），启动和呼出时会自动按屏幕比例居中摆回来
 - 仓库里不含编译产物和个人数据：`.exe`、`flashpadx.dat`、`flashpadx.ini`、`backup\` 都在 `.gitignore` 里，克隆后跑一次 `build.bat` 即可
 - 程序不联网、不装服务、不写注册表（开机自启需要自己把快捷方式放进 `shell:startup`）
