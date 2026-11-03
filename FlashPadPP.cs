@@ -712,18 +712,39 @@ namespace FlashPadPP
                 this.Height = h;
             }
 
-            int l = CfgInt("l", -1);
-            int t = CfgInt("t", -1);
-            if (l >= 0 && t >= 0)
+            int l = CfgInt("l", int.MinValue);
+            int t = CfgInt("t", int.MinValue);
+            if (l != int.MinValue && t != int.MinValue && l > -10000 && t > -10000)
             {
-                Rectangle wa = Screen.PrimaryScreen.WorkingArea;
-                if (l < wa.Width - 100 && t < wa.Height - 100)
-                {
-                    this.StartPosition = FormStartPosition.Manual;
-                    this.Left = l;
-                    this.Top = t;
-                }
+                this.StartPosition = FormStartPosition.Manual;
+                this.Left = l;
+                this.Top = t;
             }
+
+            // 上次若把 -32000 之类的“最小化坐标”存进了 ini，这里把窗口拉回主屏
+            EnsureOnScreen();
+        }
+
+        // 兜底：窗口不在任何屏幕范围内（被最小化坐标写坏、或显示器变少）时，
+        // 重新按屏幕比例居中摆放，避免“程序在跑但界面看不见”。
+        private void EnsureOnScreen()
+        {
+            Rectangle r = new Rectangle(this.Left, this.Top,
+                                        Math.Max(this.Width, 100), Math.Max(this.Height, 100));
+
+            bool onScreen = false;
+            foreach (Screen s in Screen.AllScreens)
+            {
+                if (s.WorkingArea.IntersectsWith(r)) { onScreen = true; break; }
+            }
+            if (onScreen && this.Width >= this.MinimumSize.Width && this.Height >= this.MinimumSize.Height) return;
+
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            int w = Math.Min(1240, Math.Max(900, (int)Math.Round(wa.Width * 0.80)));
+            int h = Math.Min(840, Math.Max(620, (int)Math.Round(wa.Height * 0.86)));
+            this.Size = new Size(w, h);
+            this.Left = wa.Left + (wa.Width - w) / 2;
+            this.Top = wa.Top + (wa.Height - h) / 2;
         }
 
         private void ApplyConfig()
@@ -984,13 +1005,19 @@ namespace FlashPadPP
 
         private void ShowApp()
         {
-            // 先复位窗口状态再 Show：收进托盘时状态可能还是 Minimized，
-            // 若先 Show 会立刻被上面的 Resize 处理再收回去。
-            if (this.WindowState == FormWindowState.Minimized) this.WindowState = FormWindowState.Normal;
-            this.Show();
-            this.Activate();
-            this.BringToFront();
-            _txt.Focus();
+            // 恢复窗口：先 Show 再复位窗口状态，中间用 _toTray 屏蔽“最小化就收托盘”，
+            // 否则刚显示就被 Resize 又收回去；最后校正位置，防止停在屏幕外看不见。
+            _toTray = true;
+            try
+            {
+                this.Show();
+                if (this.WindowState == FormWindowState.Minimized) this.WindowState = FormWindowState.Normal;
+                EnsureOnScreen();
+                this.Activate();
+                this.BringToFront();
+            }
+            finally { _toTray = false; }
+            try { _txt.Focus(); } catch { }
         }
 
         // 从候选表里挑第一个能注册成功的；全部失败返回 false。
@@ -1075,12 +1102,16 @@ namespace FlashPadPP
             CommitCurrent();
             SaveNow();
 
-            if (this.WindowState == FormWindowState.Normal)
+            // 用 RestoreBounds 取“还原后”的位置：窗口藏在托盘里（状态是 Minimized）时，
+            // this.Left/Top 可能是 -32000 这种占位坐标，存进 ini 下次就看不见窗口了。
+            Rectangle rb = this.RestoreBounds;
+            if (rb.Width >= this.MinimumSize.Width && rb.Height >= this.MinimumSize.Height
+                && rb.Left > -10000 && rb.Top > -10000)
             {
-                _cfg["l"] = this.Left.ToString();
-                _cfg["t"] = this.Top.ToString();
-                _cfg["w"] = this.Width.ToString();
-                _cfg["h"] = this.Height.ToString();
+                _cfg["l"] = rb.Left.ToString();
+                _cfg["t"] = rb.Top.ToString();
+                _cfg["w"] = rb.Width.ToString();
+                _cfg["h"] = rb.Height.ToString();
             }
             _cfg["font"] = _txt.Font.Name;
             _cfg["fontsize"] = ((int)_txt.Font.Size).ToString();
