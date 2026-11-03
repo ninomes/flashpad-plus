@@ -286,6 +286,7 @@ namespace FlashPadPP
         private bool _suspend = false;
         private bool _reallyExit = false;
         private bool _closeTipShown = false;
+        private bool _toTray = false;        // 正在执行“收进托盘”，防止 Resize 重入
         private bool _hotkeyOk = false;
         private int _hotkeyIdx = -1;
         private string _hotkeyName = "";
@@ -656,6 +657,22 @@ namespace FlashPadPP
             };
 
             this.Shown += delegate { try { _split.SplitterDistance = 260; } catch { } };
+
+            // 点最小化按钮（或 Win+D）时不要停在任务栏，直接收进右下角托盘：
+            // 窗口隐藏后任务栏按钮就没了，只留托盘图标。
+            this.Resize += delegate
+            {
+                if (_toTray) return;
+                if (this.WindowState == FormWindowState.Minimized && this.Visible) HideToTray();
+            };
+        }
+
+        // 收进托盘：隐藏窗口，任务栏按钮随之消失。恢复只能靠托盘图标或全局热键。
+        private void HideToTray()
+        {
+            _toTray = true;
+            try { this.Hide(); }
+            finally { _toTray = false; }
         }
 
         private static Button MakeButton(string text, int width)
@@ -967,10 +984,13 @@ namespace FlashPadPP
 
         private void ShowApp()
         {
-            this.Show();
+            // 先复位窗口状态再 Show：收进托盘时状态可能还是 Minimized，
+            // 若先 Show 会立刻被上面的 Resize 处理再收回去。
             if (this.WindowState == FormWindowState.Minimized) this.WindowState = FormWindowState.Normal;
+            this.Show();
             this.Activate();
             this.BringToFront();
+            _txt.Focus();
         }
 
         // 从候选表里挑第一个能注册成功的；全部失败返回 false。
@@ -1034,12 +1054,21 @@ namespace FlashPadPP
             if (!_reallyExit && e.CloseReason == CloseReason.UserClosing)
             {
                 e.Cancel = true;
-                this.WindowState = FormWindowState.Minimized;
-                if (!_closeTipShown)
+                CommitCurrent();          // 点 X 也先落盘，避免最后一句没保存
+                SaveNow();
+
+                // 关闭流程里直接 Hide 容易和“取消关闭”搅在一起，放到消息循环里再做：
+                // 这样窗口只是隐藏，任务栏按钮随之消失，只剩托盘图标。
+                this.BeginInvoke((MethodInvoker)delegate
                 {
-                    _closeTipShown = true;
-                    _tray.ShowBalloonTip(2500, "FlashPad++ 还在运行", "已最小化到任务栏。要真正退出，请右键托盘图标 → 退出。", ToolTipIcon.Info);
-                }
+                    HideToTray();
+                    if (!_closeTipShown)
+                    {
+                        _closeTipShown = true;
+                        string tip = _hotkeyOk ? "双击托盘图标或按 " + _hotkeyName + " 打开" : "双击托盘图标可以打开";
+                        _tray.ShowBalloonTip(2500, "FlashPad++ 还在运行", "已收进右下角托盘，任务栏不再占位。" + tip + "；要退出请右键托盘图标 → 退出。", ToolTipIcon.Info);
+                    }
+                });
                 return;
             }
 
