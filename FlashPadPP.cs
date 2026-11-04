@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -247,11 +248,14 @@ namespace FlashPadPP
         private const uint MOD_ALT = 0x0001;
         private const uint MOD_CONTROL = 0x0002;
         private const uint MOD_SHIFT = 0x0004;
+        private const uint MOD_WIN = 0x0008;
 
         [DllImport("user32.dll")]
         private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
         [DllImport("user32.dll")]
         private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
 
         // 全局热键候选表。首选 Ctrl+Alt+F；被别的软件占用时按顺序往后试，
         // 状态栏会显示最终生效的那一个，不用用户自己去猜。
@@ -288,8 +292,12 @@ namespace FlashPadPP
         private bool _closeTipShown = false;
         private bool _toTray = false;        // 正在执行“收进托盘”，防止 Resize 重入
         private bool _hotkeyOk = false;
-        private int _hotkeyIdx = -1;
         private string _hotkeyName = "";
+        private string _customHotKey = "";       // ini 里的自定义热键原文，空表示用默认候选表
+        private bool _locked = false;            // 锁定：只能看，不能改
+        private Button _btnLock;
+        private ToolTip _tips;
+        private Color _normalBackColor = Color.White;
         private string _baseDir;
         private string _dataFile;
         private string _iniFile;
@@ -485,10 +493,24 @@ namespace FlashPadPP
             Button btnDel = MakeButton("删除", 56);
             Button btnUp = MakeButton("↑", 34);
             Button btnDown = MakeButton("↓", 34);
+            _btnLock = MakeButton("", 34);
+            // System 样式的按钮不画 Image，这里用 Flat 自己控制外观
+            _btnLock.FlatStyle = FlatStyle.Flat;
+            _btnLock.BackColor = Color.FromArgb(240, 240, 240);
+            _btnLock.FlatAppearance.BorderSize = 1;
+            _btnLock.FlatAppearance.BorderColor = Color.FromArgb(190, 190, 190);
+            _btnLock.FlatAppearance.MouseOverBackColor = Color.FromArgb(230, 230, 230);
+            _btnLock.FlatAppearance.MouseDownBackColor = Color.FromArgb(212, 212, 212);
+            _btnLock.ImageAlign = ContentAlignment.MiddleCenter;
+            _btnLock.Image = CreateLockImage(false);
             btnPanel.Controls.Add(btnNew);
             btnPanel.Controls.Add(btnDel);
             btnPanel.Controls.Add(btnUp);
             btnPanel.Controls.Add(btnDown);
+            btnPanel.Controls.Add(_btnLock);
+
+            _tips = new ToolTip();
+            _tips.SetToolTip(_btnLock, "锁定 / 解锁：锁住后正文只能看不能改");
 
             Panel paneLine = new Panel();
             paneLine.Dock = DockStyle.Right;
@@ -534,10 +556,12 @@ namespace FlashPadPP
             _tray.Text = "FlashPad++";
             _tray.Visible = true;
             ContextMenuStrip trayMenu = new ContextMenuStrip();
-            ToolStripMenuItem tShow = new ToolStripMenuItem("显示");
+            ToolStripMenuItem tShow = new ToolStripMenuItem("显示 / 收起");
+            ToolStripMenuItem tSet = new ToolStripMenuItem("设置热键…");
             ToolStripMenuItem tHot = new ToolStripMenuItem("重新注册热键");
             ToolStripMenuItem tExit = new ToolStripMenuItem("退出");
             trayMenu.Items.Add(tShow);
+            trayMenu.Items.Add(tSet);
             trayMenu.Items.Add(tHot);
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add(tExit);
@@ -549,9 +573,50 @@ namespace FlashPadPP
                 TryRegisterHotKey();
                 RefreshHotKeyStatus();
                 if (_hotkeyOk)
-                    _tray.ShowBalloonTip(2000, "热键已生效", _hotkeyName + " 可以随时呼出窗口", ToolTipIcon.Info);
+                    _tray.ShowBalloonTip(2000, "热键已生效", _hotkeyName + " 呼出 / 再按一次收起", ToolTipIcon.Info);
                 else
-                    _tray.ShowBalloonTip(2500, "热键仍不可用", "候选的几种组合都被占用了。可先用托盘图标打开。", ToolTipIcon.Warning);
+                    _tray.ShowBalloonTip(2500, "热键仍不可用", "这个组合键被别的程序占用了，右键托盘图标 → 设置热键，换一个。", ToolTipIcon.Warning);
+            };
+
+            // 自定义热键：弹窗里直接按组合键，存进 ini，立刻生效
+            tSet.Click += delegate
+            {
+                string input = HotKeyDialog.Show(_hotkeyOk ? _hotkeyName : "", _customHotKey.Length > 0);
+                if (input == null) return;
+
+                input = input.Trim();
+                if (input.Length > 0)
+                {
+                    uint mods, vk;
+                    string nm;
+                    if (!ParseHotKey(input, out mods, out vk, out nm))
+                    {
+                        MessageBox.Show("这个组合键用不了：至少要有 Ctrl / Alt / Shift / Win 中的一个，再加一个字母、数字或 F1~F24。",
+                                        "FlashPad++", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+                    input = nm;    // 统一写法，比如 "alt+v" → "Alt+V"
+                }
+
+                string backup = _customHotKey;
+                _customHotKey = input;
+
+                if (TryRegisterHotKey())
+                {
+                    _cfg["hotkey"] = _customHotKey;
+                    Store.WriteIni(_iniFile, _cfg);
+                    RefreshHotKeyStatus();
+                    _tray.ShowBalloonTip(2200, "热键已更新",
+                        _hotkeyName + (_customHotKey.Length > 0 ? "（自定义）" : "（默认）") + " 呼出 / 再按一次收起", ToolTipIcon.Info);
+                }
+                else
+                {
+                    _customHotKey = backup;
+                    TryRegisterHotKey();
+                    RefreshHotKeyStatus();
+                    MessageBox.Show("这个组合键已经被别的程序占用了，已退回原来的设置。", "FlashPad++",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
             };
 
             _saveTimer = new Timer();
@@ -561,6 +626,7 @@ namespace FlashPadPP
             btnDel.Click += delegate { DoDeletePage(); };
             btnUp.Click += delegate { DoMove(-1); };
             btnDown.Click += delegate { DoMove(1); };
+            _btnLock.Click += delegate { ToggleLock(); };
 
             _miNewPage.Click += delegate { DoNewPage(); };
             _miRename.Click += delegate { DoRename(); };
@@ -599,9 +665,14 @@ namespace FlashPadPP
             };
             _miBgColor.Click += delegate
             {
+                if (_locked) { SetStatus("已锁定，先点锁图标解锁再改背景色"); return; }
                 ColorDialog cd = new ColorDialog();
-                cd.Color = _txt.BackColor;
-                if (cd.ShowDialog() == DialogResult.OK) _txt.BackColor = cd.Color;
+                cd.Color = _normalBackColor;
+                if (cd.ShowDialog() == DialogResult.OK)
+                {
+                    _normalBackColor = cd.Color;
+                    _txt.BackColor = _normalBackColor;
+                }
             };
             _miSaveNow.Click += delegate { CommitCurrent(); SaveNow(); SetStatus("已保存"); };
 
@@ -628,7 +699,7 @@ namespace FlashPadPP
                 if (idx != _lst.SelectedIndex) _lst.SelectedIndex = idx;
             };
 
-            tShow.Click += delegate { ShowApp(); };
+            tShow.Click += delegate { ToggleShow(); };
             tExit.Click += delegate { _reallyExit = true; this.Close(); };
             _tray.DoubleClick += delegate { ShowApp(); };
 
@@ -685,6 +756,76 @@ namespace FlashPadPP
             return b;
         }
 
+        // 16×16 的锁图标：锁住=闭合的橙色锁，解锁=灰色开口锁。
+        // 直接用字符（🔒）会受字体影响显示成方块，所以画出来。
+        private static Image CreateLockImage(bool locked)
+        {
+            Bitmap bmp = new Bitmap(16, 16);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+
+                Color c = locked ? Color.FromArgb(198, 112, 16) : Color.FromArgb(132, 132, 132);
+                float bodyTop = 7f, bodyLeft = 3f, bodyW = 10f, bodyH = 7f;
+                float lx = 5.5f, rx = 10.5f, arcTop = 1.8f, arcH = 5.2f;
+
+                using (Pen p = new Pen(c, 1.7f))
+                using (SolidBrush body = new SolidBrush(c))
+                {
+                    // 锁梁：左边立柱 + 圆弧（锁住时右边也有立柱，闭合成环）
+                    g.DrawLine(p, lx, bodyTop + 0.2f, lx, arcTop + arcH / 2f);
+                    if (locked)
+                    {
+                        g.DrawLine(p, rx, bodyTop + 0.2f, rx, arcTop + arcH / 2f);
+                        g.DrawArc(p, lx, arcTop, rx - lx, arcH, 180f, 180f);
+                    }
+                    else
+                    {
+                        // 解锁：圆弧只画大半圈，右侧敞开
+                        g.DrawArc(p, lx, arcTop, rx - lx, arcH, 180f, 145f);
+                    }
+
+                    g.FillRectangle(body, bodyLeft, bodyTop, bodyW, bodyH);
+                    using (SolidBrush hole = new SolidBrush(Color.White))
+                    {
+                        g.FillEllipse(hole, 7.1f, 9.3f, 1.9f, 1.9f);
+                    }
+                }
+            }
+            return bmp;
+        }
+
+        private void ToggleLock()
+        {
+            _locked = !_locked;
+            ApplyLockState();
+            SetStatus(_locked ? "已锁定：正文只能看不能改（再点锁图标解锁）" : "已解锁，可以编辑");
+        }
+
+        private void ApplyLockState()
+        {
+            _txt.ReadOnly = _locked;
+
+            // 锁定时给一点底色提示，解锁时恢复用户自己的背景色
+            _txt.BackColor = _locked ? BlendColor(_normalBackColor, Color.Gray, 0.06) : _normalBackColor;
+
+            if (_btnLock != null)
+            {
+                Image old = _btnLock.Image;
+                _btnLock.Image = CreateLockImage(_locked);
+                if (old != null) old.Dispose();
+            }
+            if (_tips != null) _tips.SetToolTip(_btnLock, _locked ? "已锁定：只能看，点一下解锁" : "锁定：锁住后正文只能看不能改");
+        }
+
+        private static Color BlendColor(Color a, Color b, double ratio)
+        {
+            return Color.FromArgb(
+                (int)(a.R + (b.R - a.R) * ratio),
+                (int)(a.G + (b.G - a.G) * ratio),
+                (int)(a.B + (b.B - a.B) * ratio));
+        }
+
         // 正文区留白：左边两个字宽，上下一半字高，右边一个字宽。
         // 字号或字体一变就按新字宽重算，避免固定像素在小字号下过大、大字号下过小。
         private void ApplyTextInsets()
@@ -703,6 +844,7 @@ namespace FlashPadPP
         private void LoadConfig()
         {
             _cfg = Store.ReadIni(_iniFile);
+            _customHotKey = CfgStr("hotkey", "");
 
             int w = CfgInt("w", 0);
             int h = CfgInt("h", 0);
@@ -767,6 +909,7 @@ namespace FlashPadPP
             catch { }
             try { _txt.BackColor = Color.FromArgb(CfgInt("backcolor", -1)); }
             catch { }
+            _normalBackColor = _txt.BackColor;
 
             _txt.WordWrap = CfgBool("wordwrap", true);
             _miWrap.Checked = _txt.WordWrap;
@@ -886,8 +1029,17 @@ namespace FlashPadPP
             _dirty = false;
         }
 
+        // 锁定状态下，凡是会改动数据的操作一律拦下，只留“看”
+        private bool LockedGuard()
+        {
+            if (!_locked) return false;
+            SetStatus("已锁定：只能查看，先点锁图标解锁");
+            return true;
+        }
+
         private void DoNewPage()
         {
+            if (LockedGuard()) return;
             CommitCurrent();
             Page p = NewPage("新建页(" + (_pages.Count + 1) + ")");
             _pages.Add(p);
@@ -901,6 +1053,7 @@ namespace FlashPadPP
 
         private void DoDeletePage()
         {
+            if (LockedGuard()) return;
             if (_cur < 0) return;
             if (_pages.Count <= 1)
             {
@@ -921,6 +1074,7 @@ namespace FlashPadPP
 
         private void DoRename()
         {
+            if (LockedGuard()) return;
             if (_cur < 0) return;
             string old = _pages[_cur].Title;
             string v = Prompt.Show("重命名页面", "页面名称：", old);
@@ -1020,10 +1174,40 @@ namespace FlashPadPP
             try { _txt.Focus(); } catch { }
         }
 
-        // 从候选表里挑第一个能注册成功的；全部失败返回 false。
+        // 同一个热键来回切换：窗口在前台就收起，否则（或已在托盘里）就唤出。
+        // 判断用“是不是前台窗口”，避免窗口被别的程序挡住时按一下反而消失。
+        private void ToggleShow()
+        {
+            bool isForeground = GetForegroundWindow() == this.Handle;
+            bool onScreen = this.Visible && this.WindowState != FormWindowState.Minimized;
+
+            if (onScreen && isForeground) HideToTray();
+            else ShowApp();
+        }
+
+        // 优先用用户自定义的组合键；没设或注册失败时，从候选表里挑第一个能注册的。
         private bool TryRegisterHotKey()
         {
             ReleaseHotKey();
+
+            if (_customHotKey.Length > 0)
+            {
+                uint mods, vk;
+                string nm;
+                if (ParseHotKey(_customHotKey, out mods, out vk, out nm))
+                {
+                    bool ok = false;
+                    try { ok = RegisterHotKey(this.Handle, HotKeyId, mods, vk); }
+                    catch { ok = false; }
+                    if (ok)
+                    {
+                        _hotkeyName = nm;
+                        _hotkeyOk = true;
+                        return true;
+                    }
+                }
+            }
+
             for (int i = 0; i < HotNames.Length; i++)
             {
                 bool ok = false;
@@ -1034,13 +1218,11 @@ namespace FlashPadPP
                 catch { ok = false; }
                 if (ok)
                 {
-                    _hotkeyIdx = i;
                     _hotkeyName = HotNames[i];
                     _hotkeyOk = true;
                     return true;
                 }
             }
-            _hotkeyIdx = -1;
             _hotkeyName = "";
             _hotkeyOk = false;
             return false;
@@ -1048,15 +1230,110 @@ namespace FlashPadPP
 
         private void ReleaseHotKey()
         {
-            if (_hotkeyIdx < 0) return;
+            if (!_hotkeyOk) return;
             try { UnregisterHotKey(this.Handle, HotKeyId); } catch { }
-            _hotkeyIdx = -1;
+            _hotkeyOk = false;
         }
 
         private void RefreshHotKeyStatus()
         {
-            if (_hotkeyOk) SetStatus("就绪  |  " + _hotkeyName + " 呼出");
+            if (_hotkeyOk) SetStatus("就绪  |  " + _hotkeyName + " 呼出 / 再按一次收起");
             else SetStatus("就绪  |  热键未生效（组合键被占用），可从托盘图标打开");
+        }
+
+        // "Alt+V" / "Ctrl+Shift+F" 这类写法 → Win32 的 modifiers + 虚拟键码
+        private static bool ParseHotKey(string text, out uint mods, out uint vk, out string name)
+        {
+            mods = 0;
+            vk = 0;
+            name = "";
+            if (text == null) return false;
+
+            string[] parts = text.Split(new char[] { '+', '＋' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2) return false;     // 必须带修饰键，避免抢占普通输入
+
+            string keyName = "";
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string u = parts[i].Trim().ToUpperInvariant();
+                if (u == "CTRL" || u == "CONTROL") mods |= MOD_CONTROL;
+                else if (u == "ALT") mods |= MOD_ALT;
+                else if (u == "SHIFT") mods |= MOD_SHIFT;
+                else if (u == "WIN" || u == "WINDOWS") mods |= MOD_WIN;
+                else keyName = parts[i].Trim();
+            }
+            if (mods == 0 || keyName.Length == 0) return false;
+
+            vk = VkFromName(keyName);
+            if (vk == 0) return false;
+
+            name = ModsName(mods) + "+" + KeyDisplayName(vk);
+            return true;
+        }
+
+        private static uint VkFromName(string k)
+        {
+            if (k.Length == 1)
+            {
+                char c = char.ToUpperInvariant(k[0]);
+                if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return (uint)c;
+            }
+            string u = k.ToUpperInvariant();
+            if (u.Length >= 2 && u[0] == 'F')
+            {
+                int n;
+                if (int.TryParse(u.Substring(1), out n) && n >= 1 && n <= 24) return (uint)(0x70 + n - 1);
+            }
+            switch (u)
+            {
+                case "SPACE": return 0x20;
+                case "INSERT": case "INS": return 0x2D;
+                case "DELETE": case "DEL": return 0x2E;
+                case "HOME": return 0x24;
+                case "END": return 0x23;
+                case "PGUP": case "PAGEUP": return 0x21;
+                case "PGDN": case "PAGEDOWN": return 0x22;
+                case "`": return 0xC0;
+                case "-": return 0xBD;
+                case "=": return 0xBB;
+                case "[": return 0xDB;
+                case "]": return 0xDD;
+                case ";": return 0xBA;
+                case "'": return 0xDE;
+                case ",": return 0xBC;
+                case ".": return 0xBE;
+                case "/": return 0xBF;
+                case "\\": return 0xDC;
+            }
+            return 0;
+        }
+
+        private static string ModsName(uint mods)
+        {
+            StringBuilder sb = new StringBuilder();
+            if ((mods & MOD_CONTROL) != 0) sb.Append("Ctrl+");
+            if ((mods & MOD_ALT) != 0) sb.Append("Alt+");
+            if ((mods & MOD_SHIFT) != 0) sb.Append("Shift+");
+            if ((mods & MOD_WIN) != 0) sb.Append("Win+");
+            string s = sb.ToString();
+            return s.Length > 0 ? s.Substring(0, s.Length - 1) : "";
+        }
+
+        private static string KeyDisplayName(uint vk)
+        {
+            if (vk >= 0x30 && vk <= 0x5A) return ((char)vk).ToString();      // 0-9 / A-Z
+            if (vk >= 0x70 && vk <= 0x87) return "F" + (vk - 0x70 + 1);
+            switch (vk)
+            {
+                case 0x20: return "Space";
+                case 0x2D: return "Insert";
+                case 0x2E: return "Delete";
+                case 0x24: return "Home";
+                case 0x23: return "End";
+                case 0x21: return "PgUp";
+                case 0x22: return "PgDn";
+            }
+            return "Key" + vk.ToString("X2");
         }
 
         protected override void OnLoad(EventArgs e)
@@ -1070,7 +1347,7 @@ namespace FlashPadPP
         {
             if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HotKeyId)
             {
-                ShowApp();
+                ToggleShow();
                 return;
             }
             base.WndProc(ref m);
@@ -1171,6 +1448,115 @@ namespace FlashPadPP
 
             if (f.ShowDialog() == DialogResult.OK) return tb.Text;
             return null;
+        }
+    }
+
+    // 自定义热键的小对话框：直接在窗口里按组合键，“所见即所得”。
+    // 返回 null=取消；空串=恢复默认；其它=组合键字符串，如 "Alt+V"
+    internal static class HotKeyDialog
+    {
+        public static string Show(string current, bool isCustom)
+        {
+            Form f = new Form();
+            f.Text = "设置全局热键";
+            f.FormBorderStyle = FormBorderStyle.FixedDialog;
+            f.StartPosition = FormStartPosition.CenterParent;
+            f.MinimizeBox = false;
+            f.MaximizeBox = false;
+            f.ShowInTaskbar = false;
+            f.ClientSize = new Size(404, 158);
+            f.Font = new Font("宋体", 12f);
+            f.KeyPreview = true;
+
+            Label tip = new Label();
+            tip.Text = isCustom ? "当前是自定义热键。按下想换成的新组合：" : "按下想用的组合键（例如 Alt+V）：";
+            tip.SetBounds(14, 12, 376, 22);
+
+            TextBox box = new TextBox();
+            box.ReadOnly = true;
+            box.TextAlign = HorizontalAlignment.Center;
+            box.SetBounds(14, 40, 376, 26);
+            box.Text = current;
+
+            Label note = new Label();
+            note.Text = "必须包含 Ctrl / Alt / Shift / Win 之一；“恢复默认”回到内置键位";
+            note.ForeColor = Color.Gray;
+            note.SetBounds(14, 70, 376, 20);
+
+            Button ok = new Button();
+            ok.Text = "确定";
+            ok.SetBounds(214, 112, 78, 28);
+
+            Button def = new Button();
+            def.Text = "恢复默认";
+            def.SetBounds(120, 112, 86, 28);
+
+            Button cc = new Button();
+            cc.Text = "取消";
+            cc.DialogResult = DialogResult.Cancel;
+            cc.SetBounds(300, 112, 90, 28);
+
+            f.Controls.Add(tip);
+            f.Controls.Add(box);
+            f.Controls.Add(note);
+            f.Controls.Add(def);
+            f.Controls.Add(ok);
+            f.Controls.Add(cc);
+            f.CancelButton = cc;
+            f.AcceptButton = ok;
+
+            f.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                Keys k = e.KeyCode;
+
+                // 单个修饰键按下时先别动，等真正的主键
+                if (k == Keys.ControlKey || k == Keys.LControlKey || k == Keys.RControlKey
+                 || k == Keys.Menu || k == Keys.LMenu || k == Keys.RMenu
+                 || k == Keys.ShiftKey || k == Keys.LShiftKey || k == Keys.RShiftKey
+                 || k == Keys.LWin || k == Keys.RWin)
+                    return;
+
+                bool noMod = !e.Control && !e.Alt && !e.Shift;
+                if (noMod && k == Keys.Escape) { f.DialogResult = DialogResult.Cancel; f.Close(); return; }
+                if (noMod && k == Keys.Enter) { ok.PerformClick(); return; }
+
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+
+                string text = "";
+                if (e.Control) text += "Ctrl+";
+                if (e.Alt) text += "Alt+";
+                if (e.Shift) text += "Shift+";
+                box.Text = text + KeyName(k);
+            };
+
+            ok.Click += delegate
+            {
+                string txt = box.Text.Trim();
+                if (txt.Length > 0 && txt.Split('+').Length < 2)
+                {
+                    MessageBox.Show("还需要按住 Ctrl / Alt / Shift / Win 中的一个。", "FlashPad++",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                f.DialogResult = DialogResult.OK;
+            };
+
+            def.Click += delegate
+            {
+                box.Text = "";
+                f.DialogResult = DialogResult.OK;
+            };
+
+            if (f.ShowDialog() == DialogResult.OK) return box.Text.Trim();
+            return null;
+        }
+
+        private static string KeyName(Keys k)
+        {
+            if (k >= Keys.D0 && k <= Keys.D9) return ((char)('0' + (k - Keys.D0))).ToString();
+            if (k >= Keys.NumPad0 && k <= Keys.NumPad9) return ((char)('0' + (k - Keys.NumPad0))).ToString();
+            return k.ToString();
         }
     }
 
